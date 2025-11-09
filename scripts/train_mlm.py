@@ -12,6 +12,7 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
 # Add parent directory to path
@@ -143,13 +144,18 @@ def load_corpus(corpus_path: str) -> List[str]:
 
 
 def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_steps, 
-                training_logger, epoch, step_counter):
+                training_logger, epoch, step_counter, writer=None):
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
     num_steps = 0
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    
+    # Calculate total steps per epoch for progress tracking
+    total_steps_per_epoch = len(dataloader) // gradient_accumulation_steps
+    if len(dataloader) % gradient_accumulation_steps != 0:
+        total_steps_per_epoch += 1
     
     optimizer.zero_grad()
     
@@ -189,12 +195,15 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
         
         # Backward pass
         loss.backward()
-
-        # Gradient clipping to prevent explosions
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
         # Gradient accumulation
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Calculate gradient norm before clipping (only when we're about to step)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            
+            # Gradient clipping to prevent explosions
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=False)
+            
             optimizer.step()
             optimizer.zero_grad()
             
@@ -206,15 +215,48 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
             
             if num_steps % 10 == 0:  # Log every 10 steps
                 current_lr = optimizer.param_groups[0]['lr']
+                
+                # Calculate perplexity
+                perplexity = torch.exp(torch.tensor(step_loss)).item()
+                
+                # Calculate token-level accuracy (only on masked positions)
+                with torch.no_grad():
+                    preds = logits.argmax(dim=-1)
+                    valid_mask = (labels != -100)
+                    if valid_mask.any():
+                        token_accuracy = (preds[valid_mask] == labels[valid_mask]).float().mean().item()
+                    else:
+                        token_accuracy = 0.0
+                
+                # Log step progress
+                step_progress = f"Step {num_steps}/{total_steps_per_epoch}"
+                
                 training_logger.log_train_step(
                     step=step_counter[0],
                     loss=step_loss,
                     lr=current_lr,
                     epoch=epoch
                 )
+                # Log additional metrics
+                training_logger.log_info(
+                    f"{step_progress} | Perplexity: {perplexity:.4f} | "
+                    f"Token Accuracy: {token_accuracy:.4f} | Grad Norm: {grad_norm:.4f}"
+                )
+                
+                # Log to TensorBoard
+                if writer is not None:
+                    writer.add_scalar('Train/Loss', step_loss, step_counter[0])
+                    writer.add_scalar('Train/LearningRate', current_lr, step_counter[0])
+                    writer.add_scalar('Train/Perplexity', perplexity, step_counter[0])
+                    writer.add_scalar('Train/TokenAccuracy', token_accuracy, step_counter[0])
+                    writer.add_scalar('Train/GradientNorm', grad_norm.item(), step_counter[0])
     
     # Handle remaining gradients if any
     if (batch_idx + 1) % gradient_accumulation_steps != 0:
+        # Calculate gradient norm before clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+        # Gradient clipping to prevent explosions
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=False)
         optimizer.step()
         optimizer.zero_grad()
     
@@ -222,11 +264,12 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
     return avg_loss
 
 
-def validate(model, dataloader, device, training_logger, epoch):
+def validate(model, dataloader, device, training_logger, epoch, writer=None):
     """Validate the model."""
     model.eval()
     total_loss = 0.0
     num_batches = 0
+    total_token_accuracy = 0.0
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     with torch.no_grad():
@@ -260,6 +303,13 @@ def validate(model, dataloader, device, training_logger, epoch):
                 training_logger.log_warning(f"NaN or Inf loss detected in validation, skipping batch")
                 continue
             
+            # Calculate token-level accuracy (only on masked positions)
+            preds = logits.argmax(dim=-1)
+            valid_mask = (labels != -100)
+            if valid_mask.any():
+                batch_token_accuracy = (preds[valid_mask] == labels[valid_mask]).float().mean().item()
+                total_token_accuracy += batch_token_accuracy
+            
             loss_value = loss.item()
             total_loss += loss_value
             num_batches += 1
@@ -269,7 +319,20 @@ def validate(model, dataloader, device, training_logger, epoch):
         return float('nan')
     
     avg_loss = total_loss / max(num_batches, 1)  # safe division
+    avg_token_accuracy = total_token_accuracy / max(num_batches, 1)
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    
     training_logger.log_validation(epoch=epoch, val_loss=avg_loss)
+    training_logger.log_info(
+        f"Validation | Perplexity: {perplexity:.4f} | Token Accuracy: {avg_token_accuracy:.4f}"
+    )
+    
+    # Log to TensorBoard
+    if writer is not None:
+        writer.add_scalar('Validation/Loss', avg_loss, epoch)
+        writer.add_scalar('Validation/Perplexity', perplexity, epoch)
+        writer.add_scalar('Validation/TokenAccuracy', avg_token_accuracy, epoch)
+    
     return avg_loss
 
 
@@ -362,6 +425,13 @@ def main():
     log_dir = os.path.join(project_root, "logs")
     training_logger = TrainingLogger(log_dir=log_dir, experiment_name="mlm_pretraining")
     
+    # Initialize TensorBoard writer
+    tb_log_dir = os.path.join(project_root, "runs", "mlm_pretraining")
+    os.makedirs(tb_log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    training_logger.log_info(f"TensorBoard logs will be saved to: {tb_log_dir}")
+    training_logger.log_info(f"View with: tensorboard --logdir {tb_log_dir}")
+    
     # Log configuration
     config = {
         'tokenizer': args.tokenizer,
@@ -442,11 +512,11 @@ def main():
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, device,
-            args.gradient_accumulation_steps, training_logger, epoch, step_counter
+            args.gradient_accumulation_steps, training_logger, epoch, step_counter, writer
         )
         
         # Validate
-        val_loss = validate(model, val_loader, device, training_logger, epoch)
+        val_loss = validate(model, val_loader, device, training_logger, epoch, writer)
         
         # Log epoch summary
         current_lr = optimizer.param_groups[0]['lr']
@@ -457,11 +527,21 @@ def main():
             lr=current_lr
         )
         
+        # Log epoch summaries to TensorBoard
+        writer.add_scalar('Epoch/TrainLoss', train_loss, epoch)
+        if not torch.isnan(torch.tensor(val_loss)):
+            writer.add_scalar('Epoch/ValLoss', val_loss, epoch)
+        writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
+        
         # Save checkpoint
         save_checkpoint(model, optimizer, epoch, val_loss, args.output_dir, training_logger)
     
     training_logger.log_info("\nTraining completed!")
     training_logger.log_info(f"Final checkpoint saved to: {args.output_dir}")
+    
+    # Close TensorBoard writer
+    writer.close()
+    training_logger.log_info("TensorBoard writer closed.")
 
 
 if __name__ == '__main__':
