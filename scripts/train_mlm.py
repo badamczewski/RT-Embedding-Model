@@ -14,6 +14,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+import math
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -143,7 +145,7 @@ def load_corpus(corpus_path: str) -> List[str]:
     return texts
 
 
-def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_steps, 
+def train_epoch(model, dataloader, optimizer, scheduler, device, gradient_accumulation_steps, 
                 training_logger, epoch, step_counter, writer=None):
     """Train for one epoch."""
     model.train()
@@ -203,10 +205,12 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
             
             # Gradient clipping to prevent explosions
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=False)
-            
+            # Update model parameters
             optimizer.step()
             optimizer.zero_grad()
-            
+            # Update learning rate scheduler
+            scheduler.step()
+
             # Logging
             step_loss = loss.item() * gradient_accumulation_steps  # Unscale for logging
             total_loss += step_loss
@@ -216,6 +220,10 @@ def train_epoch(model, dataloader, optimizer, device, gradient_accumulation_step
             if num_steps % 10 == 0:  # Log every 10 steps
                 current_lr = optimizer.param_groups[0]['lr']
                 
+                if torch.cuda.is_available():
+                    memory_alloc = torch.cuda.memory_allocated(device) / 1e6
+                    writer.add_scalar('System/GPU_Memory_MB', memory_alloc, step_counter[0])
+
                 # Calculate perplexity
                 perplexity = torch.exp(torch.tensor(step_loss)).item()
                 
@@ -491,50 +499,106 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     training_logger.log_info(f"Model initialized. Parameters: {num_params:,} (Trainable: {trainable_params:,})")
     
-    # Debug: verify that everything is set up correctly
-    training_logger.log_info("Debug: verify that everything is set up correctly")
+    # Verify that everything is set up correctly
+    training_logger.log_info("Verify that everything is set up correctly")
     training_logger.log_info(f"mask_id: {tokenizer.mask_id}")
     training_logger.log_info(f"mask embedding weights (first 5 dims): {model.token_embedding.weight[tokenizer.mask_id][:5]}")
     training_logger.log_info(f"mask embedding weights (last 5 dims): {model.token_embedding.weight[tokenizer.mask_id][-5:]}")
     
+
+
     # Optimizer
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    
+    # Learning rate scheduler
+    total_steps = math.ceil(len(train_loader) * args.epochs / args.gradient_accumulation_steps)
+    warmup_steps = int(0.05 * total_steps)  # 5% warmup
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, warmup_steps))
+        # Cosine decay after warmup
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=-1)
+
+    training_logger.log_info("Learning rate scheduler initialized.")
+    training_logger.log_info(f"Learning rate: {args.learning_rate}")
+    training_logger.log_info(f"Learning rate scheduler: {scheduler}")
+
     # Training loop
     training_logger.log_info("Starting training...")
     step_counter = [0]  # Use list to allow modification in nested function
     
-    for epoch in range(1, args.epochs + 1):
-        training_logger.log_info(f"\n{'='*60}")
-        training_logger.log_info(f"Epoch {epoch}/{args.epochs}")
-        training_logger.log_info(f"{'='*60}")
-        
-        # Train
-        train_loss = train_epoch(
-            model, train_loader, optimizer, device,
-            args.gradient_accumulation_steps, training_logger, epoch, step_counter, writer
-        )
-        
-        # Validate
-        val_loss = validate(model, val_loader, device, training_logger, epoch, writer)
-        
-        # Log epoch summary
-        current_lr = optimizer.param_groups[0]['lr']
-        training_logger.log_epoch(
-            epoch=epoch,
-            train_loss=train_loss,
-            val_loss=val_loss,
-            lr=current_lr
-        )
-        
-        # Log epoch summaries to TensorBoard
-        writer.add_scalar('Epoch/TrainLoss', train_loss, epoch)
-        if not torch.isnan(torch.tensor(val_loss)):
-            writer.add_scalar('Epoch/ValLoss', val_loss, epoch)
-        writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
-        
-        # Save checkpoint
+    try:
+        #
+        # Early stopping parameters:
+        # - patience: number of epochs without improvement allowed
+        # - best_val_loss: initialize with a large value for the best validation loss
+        # - epochs_no_improve: initialize the number of epochs without improvement
+        #
+        patience = 3
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+
+        for epoch in range(1, args.epochs + 1):
+            training_logger.log_info(f"\n{'='*60}")
+            training_logger.log_info(f"Epoch {epoch}/{args.epochs}")
+            training_logger.log_info(f"{'='*60}")
+            
+            # Train
+            train_loss = train_epoch(
+                model, train_loader, optimizer, scheduler, device,
+                args.gradient_accumulation_steps, training_logger, epoch, step_counter, writer
+            )
+            
+            # Validate
+            val_loss = validate(model, val_loader, device, training_logger, epoch, writer)
+            
+            # Log epoch summary
+            current_lr = optimizer.param_groups[0]['lr']
+            training_logger.log_epoch(
+                epoch=epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                lr=current_lr
+            )
+            
+            # Log epoch summaries to TensorBoard
+            writer.add_scalar('Epoch/TrainLoss', train_loss, epoch)
+            if not torch.isnan(torch.tensor(val_loss)):
+                writer.add_scalar('Epoch/ValLoss', val_loss, epoch)
+            writer.add_scalar('Epoch/LearningRate', current_lr, epoch)
+            
+            # Save checkpoint
+            save_checkpoint(model, optimizer, epoch, val_loss, args.output_dir, training_logger)
+
+            # Early stopping
+            if val_loss < best_val_loss - 1e-5:  # small delta for float stability
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                training_logger.log_info(f"Validation improved to {val_loss:.6f}. Reset patience counter.")
+            else:
+                epochs_no_improve += 1
+                training_logger.log_info(
+                    f"No improvement for {epochs_no_improve} epoch(s) "
+                    f"(best: {best_val_loss:.6f})."
+                )
+                if epochs_no_improve >= patience:
+                    training_logger.log_warning(
+                        f"Early stopping triggered after {patience} epochs without improvement."
+                    )
+                    break
+
+    except KeyboardInterrupt:
+        training_logger.log_info("Training interrupted by user.")
+        training_logger.log_info("Final checkpoint saved to: {args.output_dir}")
         save_checkpoint(model, optimizer, epoch, val_loss, args.output_dir, training_logger)
+        training_logger.log_info("Training completed!")
+        training_logger.log_info("TensorBoard writer closed.")
+        writer.close()
+        return
     
     training_logger.log_info("\nTraining completed!")
     training_logger.log_info(f"Final checkpoint saved to: {args.output_dir}")
